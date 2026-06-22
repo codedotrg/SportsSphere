@@ -1,4 +1,5 @@
 import { supabase } from '@/integrations/supabase/client';
+import { sendTextMessage } from './messaging';
 
 interface SendJoinRequestParams {
   eventId: string;
@@ -38,35 +39,26 @@ export const sendJoinRequest = async (params: SendJoinRequestParams) => {
       return { success: false, error: insertError };
     }
 
-    // Send a direct message to the organizer so they are notified in-app
+    // Prepare message content and metadata
     const messageText = `${requesterName || 'A user'} has requested to join your event (ID: ${eventId}).${message ? `\n\nMessage: ${message}` : ''}`;
+    const metadata = {
+      type: 'join_request',
+      eventId,
+      requesterName: requesterName || null,
+      requesterEmail: requesterEmail || null,
+      joinRequestId: requestData.id
+    };
 
-    const { error: dmError } = await supabase
-      .from('direct_messages')
-      .insert([
-        {
-          sender_id: requesterId,
-          recipient_id: organizerId,
-          content: messageText,
-          metadata: {
-            type: 'join_request',
-            eventId,
-            requesterName: requesterName || null,
-            requesterEmail: requesterEmail || null,
-            joinRequestId: requestData.id
-          },
-          is_read: false,
-          created_at: now
-        }
-      ]);
+    // Use messaging adapter to create notification (unified messages or legacy fallback)
+    const dmResult = await sendTextMessage({ senderId: requesterId, recipientId: organizerId, content: messageText, metadata });
 
-    if (dmError) {
-      console.error('Error creating direct message for join request:', dmError);
-      // Don't treat DM failure as fatal — return success for join request insertion but include dmError
-      return { success: true, request: requestData, dmError };
+    if (!dmResult.success) {
+      console.error('Error creating notification via messaging adapter:', dmResult.error);
+      // Still return success for join request insertion but include error details
+      return { success: true, request: requestData, dmError: dmResult.error };
     }
 
-    return { success: true, request: requestData };
+    return { success: true, request: requestData, messageResult: dmResult };
   } catch (err) {
     console.error('sendJoinRequest error:', err);
     return { success: false, error: err };
@@ -98,33 +90,22 @@ export const notifyJoinRequestDecision = async (params: NotifyDecisionParams) =>
       return { success: false, error: updateError };
     }
 
-    // Send notification message back to requester
     const content = `Your request to join the event (ID: ${eventId || 'unknown'}) has been ${decision} by the organizer.`;
+    const metadata = {
+      type: 'join_request_response',
+      requestId,
+      decision,
+      eventId: eventId || null
+    };
 
-    const { error: dmError } = await supabase
-      .from('direct_messages')
-      .insert([
-        {
-          sender_id: organizerId,
-          recipient_id: requesterId,
-          content,
-          metadata: {
-            type: 'join_request_response',
-            requestId,
-            decision,
-            eventId: eventId || null
-          },
-          is_read: false,
-          created_at: now
-        }
-      ]);
+    const dmResult = await sendTextMessage({ senderId: organizerId, recipientId: requesterId, content, metadata });
 
-    if (dmError) {
-      console.error('Error sending decision direct message:', dmError);
-      return { success: true, dmError };
+    if (!dmResult.success) {
+      console.error('Error sending decision via messaging adapter:', dmResult.error);
+      return { success: true, dmError: dmResult.error };
     }
 
-    return { success: true };
+    return { success: true, messageResult: dmResult };
   } catch (err) {
     console.error('notifyJoinRequestDecision error:', err);
     return { success: false, error: err };
