@@ -1,84 +1,78 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
-import { MessageCircle } from 'lucide-react';
+import { MessageCircle, Users, Clock } from 'lucide-react';
 import { useAuth } from '@/contexts/AuthContext';
+import { useMessages } from '@/hooks/useMessages';
 import { EnhancedMessageComposer } from '@/components/messaging/EnhancedMessageComposer';
-import { fetchMessages, subscribeToMessages, sendMessage as sendMessageService, Message as ServiceMessage } from '@/services/messaging';
 
 interface EventMessagingProps {
   eventId: string;
   organizerId: string;
 }
 
-export const EventMessaging: React.FC<EventMessagingProps> = ({ eventId, organizerId }) => {
+export const EventMessaging: React.FC<EventMessagingProps> = ({
+  eventId,
+  organizerId
+}) => {
   const { user } = useAuth();
-  const [messages, setMessages] = useState<ServiceMessage[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { messages, loading, sendMessage } = useMessages(eventId);
 
-  useEffect(() => {
-    let unsub: (() => void) | undefined;
-    (async () => {
-      try {
-        setLoading(true);
-        const res = await fetchMessages({ limit: 100 });
-        setMessages(res.messages.filter((m) => (m.metadata?.eventId ?? eventId) === eventId));
-      } catch (err) {
-        // keep fail-safe behavior
-        console.warn('Failed to load messages', err);
-      } finally {
-        setLoading(false);
-      }
+  const handleSendMessage = async (content: string, attachments?: File[]): Promise<boolean> => {
+    if (!content.trim()) return false;
 
-      // subscribe to live updates
-      unsub = subscribeToMessages((m) => {
-        // only include messages for this event
-        if ((m.metadata?.eventId ?? eventId) === eventId) {
-          setMessages((prev) => [...prev, m]);
-        }
-      });
-    })();
+    // For now, we'll just send the text content
+    // File attachment support for event messages can be added later
+    // sendMessage is provided by useMessages hook — it may accept the legacy signature
+    // (content, recipientId?, type?) or be migrated to accept a Message object. We keep
+    // this call in the legacy shape for backward compatibility.
+    const success = await sendMessage(
+      content,
+      user?.id === organizerId ? undefined : organizerId,
+      'general'
+    );
 
-    return () => {
-      if (unsub) unsub();
-    };
-  }, [eventId]);
-
-  const handleSendMessage = async (content: string, attachments?: File[]) => {
-    if (!user || !content.trim()) return false;
-
-    try {
-      const msg: Partial<ServiceMessage> = {
-        authorId: user.id,
-        content: content.trim(),
-        metadata: {
-          eventId,
-          message_type: 'general',
-          attachments: attachments?.length ? true : false,
-          // if not organizer, include recipient as organizer
-          recipientId: user.id === organizerId ? undefined : organizerId,
-        },
-      };
-
-      const sent = await sendMessageService(msg as ServiceMessage);
-      // append local optimistic result if needed
-      setMessages((prev) => [...prev, sent]);
-      return true;
-    } catch (err) {
-      console.error('Failed to send message', err);
-      return false;
-    }
+    return success;
   };
 
-  const formatDate = (dateString?: string) =>
-    dateString
-      ? new Date(dateString).toLocaleString(undefined, {
-          month: 'short',
-          day: 'numeric',
-          hour: '2-digit',
-          minute: '2-digit',
-        })
-      : '';
+  const formatDate = (dateString: string) => {
+    return new Date(dateString).toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+  };
+
+  const getMessageType = (message: any) => {
+    // Support old and new message shapes:
+    // - old: message.message_type
+    // - new: message.metadata?.type
+    if (!message) return 'Message';
+    if (message.message_type) return 'Team Request' === message.message_type ? 'Team Request' : message.message_type === 'join_request' ? 'Join Request' : 'Message';
+    if (message.metadata?.type) {
+      if (message.metadata.type === 'team_request') return 'Team Request';
+      if (message.metadata.type === 'join_request') return 'Join Request';
+      return String(message.metadata.type);
+    }
+    return 'Message';
+  };
+
+  // helpers to normalize the message record for display without breaking
+  const getSenderId = (message: any) => message?.sender_id ?? message?.authorId ?? message?.author_id;
+  const getSenderName = (message: any) => {
+    return message?.sender?.full_name ?? message?.sender?.name ?? message?.metadata?.authorName ?? message?.authorName ?? 'Unknown User';
+  };
+  const getCreatedAt = (message: any) => message?.created_at ?? message?.createdAt ?? message?.created;
+  const getRecipientDisplay = (message: any) => {
+    // old shape: message.recipient.full_name
+    // new shape: metadata.recipientId (just id) -> caller may need to fetch profile separately
+    if (message?.recipient?.full_name) return message.recipient.full_name;
+    if (message?.recipient?.fullName) return message.recipient.fullName;
+    if (message?.metadata?.recipientName) return message.metadata.recipientName;
+    // fallback to recipient id if present
+    return message?.recipient?.id ?? message?.metadata?.recipientId ?? null;
+  };
 
   if (loading) {
     return (
@@ -111,34 +105,45 @@ export const EventMessaging: React.FC<EventMessagingProps> = ({ eventId, organiz
               <p className="text-sm text-muted-foreground">Start a conversation!</p>
             </div>
           ) : (
-            messages.map((message) => (
-              <div
-                key={message.id ?? `${message.authorId}-${message.createdAt ?? ''}`}
-                className={`border rounded-lg p-3 ${
-                  message.authorId === user?.id ? 'bg-primary/10 ml-8' : 'bg-muted mr-8'
-                }`}
-              >
-                <div className="flex justify-between items-start mb-2">
-                  <div className="flex items-center space-x-2">
-                    <span className="font-medium text-sm">
-                      {message.authorId === user?.id ? 'You' : (message.metadata?.authorName ?? 'User')}
-                    </span>
-                    <Badge variant="outline" className="text-xs">
-                      {message.metadata?.message_type ?? 'Message'}
-                    </Badge>
+            messages.map((message: any) => {
+              const senderId = getSenderId(message);
+              const createdAt = getCreatedAt(message);
+              const messageTypeLabel = getMessageType(message);
+              const recipientDisplay = getRecipientDisplay(message);
+              const isFromMe = senderId === user?.id;
+
+              return (
+                <div
+                  key={message.id}
+                  className={`border rounded-lg p-3 ${
+                    isFromMe
+                      ? 'bg-primary/10 ml-8'
+                      : 'bg-muted mr-8'
+                  }`}
+                >
+                  <div className="flex justify-between items-start mb-2">
+                    <div className="flex items-center space-x-2">
+                      <span className="font-medium text-sm">
+                        {isFromMe ? 'You' : getSenderName(message)}
+                      </span>
+                      <Badge variant="outline" className="text-xs">
+                        {messageTypeLabel}
+                      </Badge>
+                    </div>
+                    <div className="flex items-center text-xs text-muted-foreground">
+                      <Clock className="mr-1 h-3 w-3" />
+                      <span>{createdAt ? formatDate(createdAt) : 'Unknown'}</span>
+                    </div>
                   </div>
-                  <div className="flex items-center text-xs text-muted-foreground">
-                    {formatDate(message.createdAt)}
-                  </div>
+                  <p className="text-sm whitespace-pre-wrap">{message.content ?? message.text ?? ''}</p>
+                  {recipientDisplay && !isFromMe && (
+                    <p className="text-xs text-muted-foreground mt-1">
+                      To: {recipientDisplay}
+                    </p>
+                  )}
                 </div>
-                <p className="text-sm whitespace-pre-wrap">{message.content}</p>
-                {message.metadata?.recipientId && message.authorId !== user?.id && (
-                  <p className="text-xs text-muted-foreground mt-1">
-                    To: {message.metadata?.recipientName ?? message.metadata?.recipientId}
-                  </p>
-                )}
-              </div>
-            ))
+              );
+            })
           )}
         </div>
 
@@ -146,14 +151,18 @@ export const EventMessaging: React.FC<EventMessagingProps> = ({ eventId, organiz
         <div className="border-t pt-4">
           <div className="mb-2">
             <p className="text-xs text-muted-foreground">
-              {user?.id === organizerId ? 'Broadcast to all participants' : 'Message will be sent to event organizer'}
+              {user?.id === organizerId 
+                ? 'Broadcast to all participants'
+                : 'Message will be sent to event organizer'
+              }
             </p>
           </div>
-          <EnhancedMessageComposer onSendMessage={handleSendMessage} placeholder="Type your message to the event..." />
+          <EnhancedMessageComposer
+            onSendMessage={handleSendMessage}
+            placeholder="Type your message to the event..."
+          />
         </div>
       </CardContent>
     </Card>
   );
 };
-
-export default EventMessaging;
