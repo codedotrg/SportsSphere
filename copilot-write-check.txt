@@ -1,0 +1,7 @@
+This file was created by GitHub Copilot to confirm write access.
+
+Repository: codedotrg/SportsSphere
+Timestamp: 2026-06-22
+User confirmation token: 1
+
+If you see this file, Copilot had permission to create files in the repository.
