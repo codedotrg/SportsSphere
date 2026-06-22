@@ -4,11 +4,12 @@ import { z } from "zod";
  Messaging service with adapter pattern.
  - Exposes: sendMessage, fetchMessages, subscribeToMessages
  - Uses runtime validation via Zod
- - Default adapters: Supabase (if env present) or in-memory fallback
+ - Adapter preference: Socket.IO (if SOCKET_IO_URL set) -> Supabase (if SUPABASE_URL/KEY set) -> InMemory fallback
+ - Uses dynamic requires so adapters are optional (won't crash if packages not installed)
 */
 
 export const MessageSchema = z.object({
-  id: z.string().uuid().optional(),
+  id: z.string().optional(),
   authorId: z.string(),
   content: z.string().min(1),
   createdAt: z.string().optional(),
@@ -51,7 +52,6 @@ class InMemoryAdapter implements MessagingAdapter {
 
   async fetch(opts: FetchOptions = {}) {
     const limit = opts.limit ?? 50;
-    // simple cursor = ISO timestamp, return messages after cursor
     let list = [...this.messages];
     if (opts.cursor) {
       list = list.filter((m) => (m.createdAt || "") > opts.cursor!);
@@ -71,26 +71,145 @@ class InMemoryAdapter implements MessagingAdapter {
 
 /* Utilities */
 function cryptoRandomId() {
-  // lightweight uuid fallback when crypto.randomUUID is not available
   if (typeof (globalThis as any).crypto?.randomUUID === "function")
     return (globalThis as any).crypto.randomUUID();
   return `id_${Math.random().toString(36).slice(2, 9)}`;
 }
 
-/* Adapter detection */
+/* Messages cache used by some adapters */
+let messagesCache: Message[] = [];
 let adapter: MessagingAdapter | null = null;
+
+function initSocketIOAdapter(url: string): MessagingAdapter | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { io } = require("socket.io-client");
+    const socket = io(url, { autoConnect: true });
+
+    // keep local cache updated from socket events
+    socket.on("connect", () => {
+      // optionally request initial history if server supports
+      try {
+        socket.emit("messages:fetch", { limit: 100 }, (resp: any) => {
+          if (Array.isArray(resp)) {
+            messagesCache = resp.map((r: any) => ({
+              id: r.id,
+              authorId: r.authorId || r.author_id || r.sender_id,
+              content: r.content,
+              createdAt: r.createdAt || r.created_at,
+              metadata: r.metadata || r.meta,
+            }));
+          }
+        });
+      } catch (e) {
+        // server might not support fetch via socket
+      }
+    });
+
+    socket.on("message:new", (payload: any) => {
+      const m: Message = {
+        id: payload.id,
+        authorId: payload.authorId || payload.author_id || payload.sender_id,
+        content: payload.content,
+        createdAt: payload.createdAt || payload.created_at || new Date().toISOString(),
+        metadata: payload.metadata || payload.meta,
+      };
+      messagesCache.push(m);
+      // No direct subscribers stored here; adapter.subscribe will register listeners on socket
+    });
+
+    const socketAdapter: MessagingAdapter = {
+      async send(message: Message) {
+        const validated = MessageSchema.parse(message);
+        return new Promise<Message>((resolve, reject) => {
+          socket.timeout(5000).emit("message:send", validated, (err: any, ack: any) => {
+            if (err) return reject(err);
+            const rec: any = ack || {};
+            const m: Message = {
+              id: rec.id || cryptoRandomId(),
+              authorId: rec.authorId || rec.author_id || validated.authorId,
+              content: rec.content || validated.content,
+              createdAt: rec.createdAt || rec.created_at || new Date().toISOString(),
+              metadata: rec.metadata || validated.metadata,
+            };
+            messagesCache.push(m);
+            resolve(m);
+          });
+        });
+      },
+
+      async fetch(opts: FetchOptions = {}) {
+        // prefer to fetch via socket if supported
+        try {
+          return new Promise<FetchResult>((resolve) => {
+            socket.timeout(5000).emit("messages:fetch", opts, (resp: any) => {
+              if (!resp) return resolve({ messages: [...messagesCache].slice(- (opts.limit ?? 50)), cursor: null });
+              const messages: Message[] = resp.map((r: any) => ({
+                id: r.id,
+                authorId: r.authorId || r.author_id || r.sender_id,
+                content: r.content,
+                createdAt: r.createdAt || r.created_at,
+                metadata: r.metadata || r.meta,
+              }));
+              const cursor = messages.length ? messages[messages.length - 1].createdAt || null : null;
+              // merge into cache
+              messagesCache = Array.from(new Set([...messagesCache, ...messages] as any)) as Message[];
+              resolve({ messages, cursor });
+            });
+          });
+        } catch (e) {
+          // fallback to cache
+          const msgs = [...messagesCache].slice(- (opts.limit ?? 50));
+          const cursor = msgs.length ? msgs[msgs.length - 1].createdAt || null : null;
+          return { messages: msgs, cursor };
+        }
+      },
+
+      subscribe(cb: (m: Message) => void) {
+        const listener = (payload: any) => {
+          const m: Message = {
+            id: payload.id,
+            authorId: payload.authorId || payload.author_id || payload.sender_id,
+            content: payload.content,
+            createdAt: payload.createdAt || payload.created_at || new Date().toISOString(),
+            metadata: payload.metadata || payload.meta,
+          };
+          messagesCache.push(m);
+          cb(m);
+        };
+        socket.on("message:new", listener);
+        return () => socket.off("message:new", listener);
+      },
+    };
+
+    return socketAdapter;
+  } catch (e) {
+    // socket.io-client not installed or failed
+    // eslint-disable-next-line no-console
+    console.warn("Socket.IO adapter unavailable:", e);
+    return null;
+  }
+}
 
 function getDefaultAdapter(): MessagingAdapter {
   if (adapter) return adapter;
 
-  // Prefer Supabase if ENV variables are set. We avoid importing @supabase/supabase-js at top-level
-  // so the package is optional and the code won't crash if not installed.
+  const SOCKET_IO_URL = process.env.SOCKET_IO_URL || (globalThis as any).__SOCKET_IO_URL;
   const SUPABASE_URL = process.env.SUPABASE_URL || (globalThis as any).__SUPABASE_URL;
   const SUPABASE_KEY = process.env.SUPABASE_KEY || (globalThis as any).__SUPABASE_KEY;
 
+  // Prefer Socket.IO when configured
+  if (SOCKET_IO_URL) {
+    const socketAdapter = initSocketIOAdapter(SOCKET_IO_URL);
+    if (socketAdapter) {
+      adapter = socketAdapter;
+      return adapter;
+    }
+  }
+
+  // Next prefer Supabase when configured
   if (SUPABASE_URL && SUPABASE_KEY) {
     try {
-      // Dynamically require to avoid hard dependency at runtime in environments without the package
       // eslint-disable-next-line @typescript-eslint/no-var-requires
       const { createClient } = require("@supabase/supabase-js");
       const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
@@ -101,14 +220,15 @@ function getDefaultAdapter(): MessagingAdapter {
           const payload = { author_id: validated.authorId, content: validated.content, metadata: validated.metadata };
           const { data, error } = await supabase.from("messages").insert(payload).select("*").single();
           if (error) throw error;
-          // map record to Message
-          return {
+          const m: Message = {
             id: data.id,
             authorId: data.author_id,
             content: data.content,
             createdAt: data.created_at,
             metadata: data.metadata,
-          } as Message;
+          };
+          messagesCache.push(m);
+          return m;
         },
         async fetch(opts = {}) {
           const limit = opts.limit ?? 50;
@@ -125,17 +245,19 @@ function getDefaultAdapter(): MessagingAdapter {
             createdAt: r.created_at,
             metadata: r.metadata,
           }));
+          messagesCache = Array.from(new Set([...messagesCache, ...messages] as any)) as Message[];
           const cursor = messages.length ? messages[messages.length - 1].createdAt || null : null;
           return { messages, cursor };
         },
         subscribe(cb) {
           const channel = supabase.channel("public:messages").on("postgres_changes", { event: "INSERT", schema: "public", table: "messages" }, (payload: any) => {
             const record = payload.new;
-            cb({ id: record.id, authorId: record.author_id, content: record.content, createdAt: record.created_at, metadata: record.metadata });
+            const m: Message = { id: record.id, authorId: record.author_id, content: record.content, createdAt: record.created_at, metadata: record.metadata };
+            messagesCache.push(m);
+            cb(m);
           }).subscribe();
 
           return () => {
-            // unsubscribe
             channel.unsubscribe();
           };
         },
@@ -144,8 +266,6 @@ function getDefaultAdapter(): MessagingAdapter {
       adapter = supabaseAdapter;
       return adapter;
     } catch (e) {
-      // supabase not installed or failed to initialize — fallback to in-memory
-      /* eslint-disable no-console */
       console.warn("Supabase adapter unavailable, falling back to InMemoryAdapter", e);
     }
   }
