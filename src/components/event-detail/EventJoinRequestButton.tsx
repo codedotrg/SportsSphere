@@ -3,15 +3,22 @@ import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
 import { Textarea } from '@/components/ui/textarea';
 import { UserPlus, MessageCircle } from 'lucide-react';
+import { useAuth } from '@/contexts/AuthContext';
+import { useToast } from '@/hooks/use-toast';
+import { sendJoinRequest } from '@/services/joinRequests';
 
 interface EventJoinRequestButtonProps {
+  eventId?: string;
+  organizerId?: string;
   isOrganizer: boolean;
   isParticipant: boolean;
   hasJoinRequest: boolean;
-  onSendJoinRequest: (message: string) => Promise<void>;
+  onSendJoinRequest?: (message: string) => Promise<void>;
 }
 
 export const EventJoinRequestButton: React.FC<EventJoinRequestButtonProps> = ({
+  eventId,
+  organizerId,
   isOrganizer,
   isParticipant,
   hasJoinRequest,
@@ -20,11 +27,44 @@ export const EventJoinRequestButton: React.FC<EventJoinRequestButtonProps> = ({
   const [showJoinRequestForm, setShowJoinRequestForm] = useState(false);
   const [joinMessage, setJoinMessage] = useState('');
   const [sending, setSending] = useState(false);
+  const { user } = useAuth();
+  const { toast } = useToast();
+  const [localPending, setLocalPending] = useState(false);
 
   const handleEventJoinRequest = async () => {
+    if (sending) return;
     setSending(true);
+
     try {
-      await onSendJoinRequest(joinMessage);
+      if (onSendJoinRequest) {
+        await onSendJoinRequest(joinMessage);
+        toast({ title: 'Request sent', description: 'Your join request was sent.' });
+      } else {
+        // Use built-in service
+        if (!eventId || !organizerId || !user) {
+          toast({ title: 'Error', description: 'Missing event, organizer, or user information', variant: 'destructive' });
+          setSending(false);
+          return;
+        }
+
+        const result = await sendJoinRequest({
+          eventId,
+          organizerId,
+          requesterId: user.id,
+          requesterName: user.user_metadata?.full_name || user.email?.split('@')[0],
+          requesterEmail: user.email,
+          message: joinMessage
+        });
+
+        if (result.success) {
+          toast({ title: 'Request sent', description: 'Organizer has been notified.' });
+          setLocalPending(true);
+        } else {
+          toast({ title: 'Error', description: 'Failed to send join request', variant: 'destructive' });
+          console.error(result.error || result);
+        }
+      }
+
       setJoinMessage('');
       setShowJoinRequestForm(false);
     } finally {
@@ -35,10 +75,11 @@ export const EventJoinRequestButton: React.FC<EventJoinRequestButtonProps> = ({
   // Hide button for organizers and participants
   if (isOrganizer || isParticipant) return null;
 
+  const isPending = hasJoinRequest || localPending;
+
   return (
     <>
-      {/* Join Event Request Button */}
-      {!hasJoinRequest ? (
+      {!isPending ? (
         <Button onClick={() => setShowJoinRequestForm(true)}>
           <UserPlus className="mr-2 h-4 w-4" />
           Request to Join Event
@@ -50,7 +91,6 @@ export const EventJoinRequestButton: React.FC<EventJoinRequestButtonProps> = ({
         </Button>
       )}
 
-      {/* Join Request Form */}
       {showJoinRequestForm && (
         <Card className="mt-6">
           <CardContent className="pt-6">
